@@ -8,7 +8,7 @@ on the student's machine.
 ## Privacy and cost
 
 - The job URL is provided through the `JOB_1_URL` repository secret.
-- No model API keys are needed: Ollama runs the open-source `qwen3:4b` model.
+- No model API keys are needed: Ollama runs the open-source `qwen3:8b` model.
 - Only standard public-repository runner compute is used.
 - There are no artifact uploads, caches, paid APIs, or automatic triggers.
 - Job data, model messages, receipts, and diagnostic logs are encrypted to
@@ -19,3 +19,7 @@ on the student's machine.
 The workflow is started manually and has a 45-minute timeout. Only the named
 course job MCP endpoint, course skill downloads, and the runner's local Ollama
 service are available to the model. It cannot execute shell commands.
+
+The model uses native tool calls. Identical repeated calls are blocked to
+prevent loops. A successful receipt ends the run immediately; otherwise the
+worker stops after 45 model turns or six redundant calls.

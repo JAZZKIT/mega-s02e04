@@ -55,7 +55,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ollama pull qwen3:4b > "$RUNNER_TEMP/model-download.log" 2>&1
+          ollama pull qwen3:8b > "$RUNNER_TEMP/model-download.log" 2>&1
           echo 'Free model is ready.'
       - name: Run independent incident worker
         env:

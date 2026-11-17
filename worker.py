@@ -26,7 +26,7 @@ REQUEST_ID = 0
 JOB_URL = os.environ["JOB_1_URL"]
 SKILL_ZIP = "https://hq.mega.dev/media/two-places/incident-lookup-03b5d3a7.zip"
 SKILL_URI = "skill://incident-lookup/SKILL.md"
-MODEL = "qwen3:4b"
+MODEL = "qwen3:8b"
 WORKER_FILES = {}
 
 
@@ -101,9 +101,9 @@ def text_content(result):
                      if isinstance(item, dict))
 
 
-def call_model(messages):
-    body = {"model": MODEL, "messages": messages, "stream": False,
-            "think": False, "format": "json", "keep_alive": "45m",
+def call_model(messages, tools):
+    body = {"model": MODEL, "messages": messages, "tools": tools, "stream": False,
+            "think": False, "keep_alive": "45m",
             "options": {"temperature": 0, "num_ctx": 16384, "num_predict": 1500}}
     log("model_request", body)
     request = urllib.request.Request("http://127.0.0.1:11434/api/chat",
@@ -112,7 +112,7 @@ def call_model(messages):
     with urllib.request.urlopen(request, timeout=600) as response:
         result = json.load(response)
     log("model_response", result)
-    return result["message"]["content"]
+    return result["message"]
 
 
 def has_receipt(value):
@@ -167,15 +167,13 @@ Do not use other services, execute commands, spend money, or ask for secrets.
 Keep job links, receipts, and all task data confidential: results are encrypted
 for the main harness. The tools listed below are available on YOUR job endpoint.
 
-Return ONLY one JSON object per turn, one of these shapes:
-{"action":"call","name":"EXACT_MCP_TOOL_NAME","arguments":{...}}
-{"action":"resource","uri":"exact resource URI"}
-{"action":"read_skill_file","path":"exact file path from the list"}
-{"action":"done","result":"exact accepted result or specific blocker"}
-
-Do not return done before the course accepts your submit and issues a receipt.
-No markdown fences. Call tools one by one. Use the tool inputSchema exactly.
-Do not assume tool argument names or use a wrapper around arguments.
+Use native function calls to call the supplied tools. Call tools one by one.
+Use each tool's parameters schema exactly. Do not assume argument names.
+After a successful lookup, USE the returned information to progress: do not
+repeat the same search with unchanged arguments. Follow the next step in the
+tool's response and in your skill. Finish the job with its submit tool.
+Do not stop before the course accepts your submit and issues a receipt.
+If you are blocked, call worker_report_blocker with a precise reason.
 """
     system += "\nSERVER INSTRUCTIONS:\n" + init.get("instructions", "")
     system += "\nREQUIRED SKILL:\n" + skill
@@ -184,36 +182,58 @@ Do not assume tool argument names or use a wrapper around arguments.
     messages = [{"role": "system", "content": system},
                 {"role": "user", "content": "Begin your incident-lookup job. Follow the skill and complete your submit."}]
     tool_names = {tool["name"] for tool in tools.get("tools", [])}
-    for turn in range(70):
-        raw = call_model(messages)
-        messages.append({"role": "assistant", "content": raw})
-        try:
-            command = json.loads(raw)
-            action = command.get("action")
-            if action == "call":
-                if command.get("name") not in tool_names:
-                    observation = {"error": "Unknown tool. Use an exact name from AVAILABLE MCP TOOLS."}
-                else:
-                    observation = rpc("tools/call", {"name": command["name"],
-                                                     "arguments": command.get("arguments", {})})
-                    if has_receipt(observation):
-                        return {"status": "receipt_returned", "accepted_response": observation,
-                                "model": MODEL, "turns": turn + 1}
-            elif action == "resource":
-                observation = rpc("resources/read", {"uri": command["uri"]})
-            elif action == "read_skill_file":
-                observation = {"text": WORKER_FILES.get(command.get("path"), "File not found")}
-            elif action == "done":
-                observation = {"error": "No receipt has been returned yet. Continue until submit is accepted, or return action blocked with a precise reason."}
-            elif action == "blocked":
-                return {"status": "blocked", "reason": command.get("result", command)}
+    native_tools = [{"type": "function", "function": {
+        "name": tool["name"], "description": tool.get("description", ""),
+        "parameters": tool.get("inputSchema", {"type": "object", "properties": {}})}}
+        for tool in tools.get("tools", [])]
+    for name, description, properties in [
+        ("worker_read_resource", "Read a resource on your job MCP server", {"uri": {"type": "string"}}),
+        ("worker_read_skill_file", "Read a downloaded file belonging to your required skill", {"path": {"type": "string"}}),
+        ("worker_report_blocker", "Stop with a specific blocker when you cannot complete the job", {"reason": {"type": "string"}}),
+    ]:
+        native_tools.append({"type": "function", "function": {
+            "name": name, "description": description,
+            "parameters": {"type": "object", "properties": properties, "required": list(properties)}}})
+    seen_calls = {}
+    duplicate_attempts = 0
+    for turn in range(45):
+        message = call_model(messages, native_tools)
+        messages.append(message)
+        calls = message.get("tool_calls", [])
+        if not calls:
+            messages.append({"role": "user", "content": "The job has no accepted receipt yet. Take the next step using a native tool call. If truly blocked, call worker_report_blocker."})
+            continue
+        for call in calls:
+            function = call["function"]
+            name = function["name"]
+            arguments = function.get("arguments", {})
+            if isinstance(arguments, str):
+                arguments = json.loads(arguments)
+            fingerprint = json.dumps({"name": name, "arguments": arguments}, sort_keys=True)
+            if fingerprint in seen_calls:
+                duplicate_attempts += 1
+                observation = {"error": "This exact call was already made. Do not repeat it. Use the returned information and the required skill to take a DIFFERENT next step.",
+                               "previous_response": seen_calls[fingerprint]}
+                if duplicate_attempts >= 6:
+                    return {"status": "repeated_call_guard", "reason": "Worker attempted six redundant tool calls"}
+            elif name in tool_names:
+                observation = rpc("tools/call", {"name": name, "arguments": arguments})
+                seen_calls[fingerprint] = observation
+                if has_receipt(observation):
+                    return {"status": "receipt_returned", "accepted_response": observation,
+                            "model": MODEL, "turns": turn + 1}
+            elif name == "worker_read_resource":
+                observation = rpc("resources/read", {"uri": arguments["uri"]})
+            elif name == "worker_read_skill_file":
+                observation = {"text": WORKER_FILES.get(arguments.get("path"), "File not found")}
+            elif name == "worker_report_blocker":
+                return {"status": "blocked", "reason": arguments.get("reason")}
             else:
-                observation = {"error": "Return one JSON object using action call, resource, read_skill_file, or done."}
-        except (ValueError, KeyError, TypeError) as error:
-            observation = {"error": str(error), "instruction": "Use valid JSON and exact action schema."}
-        messages.append({"role": "user", "content": json.dumps(observation, ensure_ascii=False)})
+                observation = {"error": "Unknown function. Use only the supplied native tools."}
+            messages.append({"role": "tool", "tool_name": name,
+                             "content": json.dumps(observation, ensure_ascii=False)})
         print("Worker completed tool turn " + str(turn + 1) + ".", flush=True)
-    return {"status": "turn_limit", "reason": "No accepted receipt after 70 worker turns"}
+    return {"status": "turn_limit", "reason": "No accepted receipt after 45 worker turns"}
 
 
 def emit_encrypted(bundle):
