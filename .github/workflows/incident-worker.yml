@@ -16,7 +16,6 @@ jobs:
     timeout-minutes: 45
     env:
       OLLAMA_HOST: 127.0.0.1:11434
-      OLLAMA_MODELS: ${{ runner.temp }}/models
       OLLAMA_NUM_PARALLEL: '1'
       OLLAMA_MAX_LOADED_MODELS: '1'
       OLLAMA_NO_CLOUD: '1'
@@ -28,6 +27,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          echo "OLLAMA_MODELS=$RUNNER_TEMP/models" >> "$GITHUB_ENV"
           mkdir -p "$RUNNER_TEMP/ollama"
           curl --fail --silent --show-error --location --retry 2 \
             https://github.com/ollama/ollama/releases/download/v0.40.16/ollama-linux-amd64.tar.zst \
