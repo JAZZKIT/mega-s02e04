@@ -28,6 +28,8 @@ SKILL_ZIP = "https://hq.mega.dev/media/two-places/incident-lookup-03b5d3a7.zip"
 SKILL_URI = "skill://incident-lookup/SKILL.md"
 MODEL = "qwen3:8b"
 WORKER_FILES = {}
+STEP_TOKEN = None
+OPAQUE_TOKENS = {}
 
 
 def redact(value):
@@ -99,6 +101,43 @@ def result_of(value):
 def text_content(result):
     return "\n".join(item.get("text", "") for item in result.get("contents", [])
                      if isinstance(item, dict))
+
+
+def capture_tokens(value):
+    """Keep opaque chaining credentials out of the language model's hands."""
+    global STEP_TOKEN
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key == "step" and isinstance(item, str):
+                STEP_TOKEN = item
+                if item not in OPAQUE_TOKENS:
+                    OPAQUE_TOKENS[item] = "[opaque-step-" + str(len(OPAQUE_TOKENS) + 1) + "]"
+            else:
+                capture_tokens(item)
+    elif isinstance(value, list):
+        for item in value:
+            capture_tokens(item)
+    elif isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except ValueError:
+            return
+        if isinstance(decoded, (dict, list)):
+            capture_tokens(decoded)
+
+
+def model_observation(value):
+    text = json.dumps(value, ensure_ascii=False)
+    for token, handle in OPAQUE_TOKENS.items():
+        text = text.replace(token, handle)
+    return text
+
+
+def with_step_token(arguments, schema):
+    actual = dict(arguments)
+    if STEP_TOKEN and ("step" in actual or "step" in schema.get("properties", {})):
+        actual["step"] = STEP_TOKEN
+    return actual
 
 
 def call_model(messages, tools):
@@ -174,6 +213,9 @@ repeat the same search with unchanged arguments. Follow the next step in the
 tool's response and in your skill. Finish the job with its submit tool.
 Do not stop before the course accepts your submit and issues a receipt.
 If you are blocked, call worker_report_blocker with a precise reason.
+Step tokens are opaque credentials. The worker runtime preserves them exactly
+and injects the current one into chained calls. You see only placeholder
+handles. Do not invent, edit, decode, or manually copy step tokens.
 """
     system += "\nSERVER INSTRUCTIONS:\n" + init.get("instructions", "")
     system += "\nREQUIRED SKILL:\n" + skill
@@ -182,6 +224,7 @@ If you are blocked, call worker_report_blocker with a precise reason.
     messages = [{"role": "system", "content": system},
                 {"role": "user", "content": "Begin your incident-lookup job. Follow the skill and complete your submit."}]
     tool_names = {tool["name"] for tool in tools.get("tools", [])}
+    tool_schemas = {tool["name"]: tool.get("inputSchema", {}) for tool in tools.get("tools", [])}
     native_tools = [{"type": "function", "function": {
         "name": tool["name"], "description": tool.get("description", ""),
         "parameters": tool.get("inputSchema", {"type": "object", "properties": {}})}}
@@ -209,6 +252,7 @@ If you are blocked, call worker_report_blocker with a precise reason.
             arguments = function.get("arguments", {})
             if isinstance(arguments, str):
                 arguments = json.loads(arguments)
+            arguments = with_step_token(arguments, tool_schemas.get(name, {}))
             fingerprint = json.dumps({"name": name, "arguments": arguments}, sort_keys=True)
             if fingerprint in seen_calls:
                 duplicate_attempts += 1
@@ -218,6 +262,7 @@ If you are blocked, call worker_report_blocker with a precise reason.
                     return {"status": "repeated_call_guard", "reason": "Worker attempted six redundant tool calls"}
             elif name in tool_names:
                 observation = rpc("tools/call", {"name": name, "arguments": arguments})
+                capture_tokens(observation)
                 seen_calls[fingerprint] = observation
                 if has_receipt(observation):
                     return {"status": "receipt_returned", "accepted_response": observation,
@@ -231,7 +276,7 @@ If you are blocked, call worker_report_blocker with a precise reason.
             else:
                 observation = {"error": "Unknown function. Use only the supplied native tools."}
             messages.append({"role": "tool", "tool_name": name,
-                             "content": json.dumps(observation, ensure_ascii=False)})
+                             "content": model_observation(observation)})
         print("Worker completed tool turn " + str(turn + 1) + ".", flush=True)
     return {"status": "turn_limit", "reason": "No accepted receipt after 45 worker turns"}
 

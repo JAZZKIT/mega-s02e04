@@ -23,3 +23,7 @@ service are available to the model. It cannot execute shell commands.
 The model uses native tool calls. Identical repeated calls are blocked to
 prevent loops. A successful receipt ends the run immediately; otherwise the
 worker stops after 45 model turns or six redundant calls.
+
+Opaque step tokens never pass through model-generated text. The runtime keeps
+each exact token returned by the server, shows the model a placeholder, and
+injects the current token into the next tool request.
